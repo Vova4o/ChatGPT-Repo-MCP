@@ -86,9 +86,15 @@ func TestDoctorStorageCheckHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result := New(testSettings(t.TempDir()), nil).doctor(ctx)
-	storage, ok := result["artifact_storage"].(map[string]any)
-	if !ok || storage["ok"] != false || result["ok"] != false {
+	if result["ok"] != false {
 		t.Fatalf("doctor ignored cancellation: %#v", result)
+	}
+	if storage, ok := result["artifact_storage"].(map[string]any); ok {
+		if storage["ok"] != false {
+			t.Fatalf("storage check ignored cancellation: %#v", storage)
+		}
+	} else if result["error_kind"] != "operation_cancelled" {
+		t.Fatalf("doctor omitted cancellation diagnosis: %#v", result)
 	}
 }
 
