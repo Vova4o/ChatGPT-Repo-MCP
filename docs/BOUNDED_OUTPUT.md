@@ -88,6 +88,12 @@ operation records provide `cancel_tool` and `cancel_id` for
 `cancel_command_job` or `close_terminal_session`. `doctor` embeds the current
 heavy-pool snapshot under its resource diagnostics.
 
+`list_operations` covers work outside the heavy pool as well, including native
+filesystem walks. Heavy records link to it through `tracking_operation_id`.
+Use `get_operation` to distinguish cancellation acknowledgement from completion;
+`cancel_operation` unifies cancellation of supported tracked work. Existing job
+and terminal management APIs remain available. See [OPERATIONS.md](OPERATIONS.md).
+
 ## Audit and incident diagnosis
 
 Heavy operations write a redacted start record before execution and a finish
@@ -106,3 +112,26 @@ For an incident:
 Quota, reserve, short-write, `ENOSPC`, or I/O failures fail closed with a typed
 persistence error. They must not fall back to retaining the missing output in
 RAM.
+
+
+## Periodic maintenance
+
+ChatRepo performs low-frequency housekeeping inside the MCP process itself; no
+extra daemon or systemd timer is required. Defaults:
+
+```env
+MAINTENANCE_ENABLED=true
+MAINTENANCE_INTERVAL_SECONDS=21600
+ARTIFACT_TTL_SECONDS=604800
+AUDIT_LOG_TTL_SECONDS=604800
+```
+
+The maintenance worker sleeps between passes. It removes only expired completed
+artifacts, abandoned temporary files, and rotated audit generations. Active jobs,
+active/pinned artifacts, and the current `commands.log` are never deleted by
+the periodic pass.
+
+For a three-day retention window use `ARTIFACT_TTL_SECONDS=259200` and
+`AUDIT_LOG_TTL_SECONDS=259200`.
+
+Computer Use observation frames are not part of this storage: they stay in memory and are discarded with their snapshot/idle lifecycle. An explicit `computer_share_snapshot` call creates a separate private cache PNG only for chat delivery; it is not a command/job artifact and is deleted after five minutes (with maintenance cleanup as crash fallback).

@@ -17,6 +17,7 @@ import (
 )
 
 type job struct {
+	OperationID         string
 	mu                  sync.RWMutex
 	ID                  string
 	LogID               string
@@ -195,6 +196,9 @@ func (e *Engine) commandRequestFromArgsWithLimit(args map[string]any, exempt boo
 }
 
 func (e *Engine) runCommand(ctx context.Context, request commandRequest) map[string]any {
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", "Operation cancelled before execution")
+	}
 	started := time.Now()
 	normalized, kind, err := e.checkCommandPolicy(request.Command, request.Confirmed, request.PolicyExempt)
 	if err != nil {
@@ -209,7 +213,7 @@ func (e *Engine) runCommand(ctx context.Context, request commandRequest) map[str
 		return withError("invalid_cwd", err)
 	}
 	logID := randomID()
-	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: "run_command", CWD: directory, RequestID: logID})
+	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: "run_command", CWD: directory, RequestID: logID, Context: ctx})
 	if !acquired {
 		return e.heavyBusyResult()
 	}
@@ -225,7 +229,7 @@ func (e *Engine) runCommand(ctx context.Context, request commandRequest) map[str
 	if err != nil {
 		return outputPersistenceError(err)
 	}
-	e.writeCommandAudit("start", logID, "run_command", normalized, directory, 0, 0, 0, "running")
+	e.writeCommandAuditContext(ctx, "start", logID, "run_command", normalized, directory, 0, 0, 0, "running")
 	result := e.runShell(runContext, normalized, directory, request.Timeout, request.Env, capture)
 	if err := capture.Close(); err != nil {
 		return outputPersistenceError(err)
@@ -251,7 +255,7 @@ func (e *Engine) runCommand(ctx context.Context, request commandRequest) map[str
 		}
 	}
 	e.writeCommandMetadata(logID, normalized, directory, result.ExitCode)
-	e.writeCommandAudit("finish", logID, "run_command", normalized, directory, time.Since(started), capture.stdout.Total(), capture.stderr.Total(), map[bool]string{true: "completed", false: "failed"}[result.ExitCode == 0 && !result.TimedOut])
+	e.writeCommandAuditContext(ctx, "finish", logID, "run_command", normalized, directory, time.Since(started), capture.stdout.Total(), capture.stderr.Total(), map[bool]string{true: "completed", false: "failed"}[result.ExitCode == 0 && !result.TimedOut])
 	// Determine truncation from the capture budget before TailLines
 	// normalization. Formatting may remove a trailing newline without losing
 	// any source output.
@@ -344,15 +348,30 @@ func (e *Engine) runShell(parent context.Context, command, directory string, tim
 	process.Stdout = capture.stdout
 	process.Stderr = capture.stderr
 	configureProcessGroup(process)
+	if ctx.Err() != nil {
+		return processResult{ExitCode: -1, Stderr: ctx.Err().Error()}
+	}
 	err := process.Start()
 	if err == nil {
 		done := make(chan error, 1)
+		e.operationProcess(parent, process.Process.Pid)
+		defer e.operationProcess(parent, 0)
 		go func() { done <- process.Wait() }()
 		select {
 		case err = <-done:
 		case <-ctx.Done():
-			_, _ = terminateProcessGroup(process.Process.Pid, e.settings.KillGrace)
-			err = <-done
+			select {
+			case err = <-done:
+			default:
+				if ctx.Err() == context.Canceled {
+					e.acknowledgeCancellation(parent)
+				}
+				_, stopErr := terminateProcessGroup(process.Process.Pid, e.settings.KillGrace)
+				if stopErr != nil {
+					e.operationCancelError(currentOperation(parent), failure("process_stop_failed", stopErr.Error()))
+				}
+				err = <-done
+			}
 		}
 	}
 	exitCode := 0
@@ -541,6 +560,8 @@ func (e *Engine) startJobRequest(parent context.Context, args map[string]any, po
 			if onConflict == "wait" {
 				select {
 				case <-existing.done:
+				case <-parent.Done():
+					return failure("operation_cancelled", parent.Err().Error())
 				case <-time.After(min(request.Timeout, 30*time.Second)):
 					return map[string]any{"ok": false, "error_kind": "job_lock_conflict", "job_id": existing.ID, "concurrency_key": request.ConcurrencyKey}
 				}
@@ -550,26 +571,64 @@ func (e *Engine) startJobRequest(parent context.Context, args map[string]any, po
 			}
 		}
 	}
+	if parent.Err() != nil {
+		return failure("operation_cancelled", parent.Err().Error())
+	}
 	id := randomID()
 	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: "start_command_job", CWD: directory, RequestID: id, CancelTool: "cancel_command_job", CancelID: id})
 	if !acquired {
 		return e.heavyBusyResult()
 	}
-	jobContext, cancel := context.WithTimeout(context.Background(), request.Timeout)
-	entry := &job{ID: id, LogID: randomID(), Command: normalized, CWD: directory, Status: "running", Timeout: request.Timeout, StartedAt: time.Now().UTC(), ExitCode: -1, ConcurrencyKey: request.ConcurrencyKey, cancel: cancel, heavyLease: heavyLease, done: make(chan struct{})}
+	detachedParent := WithOperationIdentity(context.Background(), OperationIdentity{})
+	if op := currentOperation(parent); op != nil {
+		detachedParent = WithOperationIdentity(detachedParent, op.identity)
+		detachedParent = context.WithValue(detachedParent, operationContextKey{}, op)
+	}
+	detachedContext, tracked := e.operations.start(detachedParent, "start_command_job", map[string]any{"cwd": directory}, "job", true)
+	e.operations.mu.Lock()
+	tracked.data["resource_id"] = id
+	e.operations.mu.Unlock()
+	jobContext, cancel := context.WithTimeout(detachedContext, request.Timeout)
+	e.heavyMu.Lock()
+	if heavy := e.heavyOps[heavyLease.id]; heavy != nil {
+		heavy.Spec.Context = detachedContext
+	}
+	e.heavyMu.Unlock()
+	entry := &job{OperationID: tracked.id, ID: id, LogID: randomID(), Command: normalized, CWD: directory, Status: "running", Timeout: request.Timeout, StartedAt: time.Now().UTC(), ExitCode: -1, ConcurrencyKey: request.ConcurrencyKey, cancel: cancel, heavyLease: heavyLease, done: make(chan struct{})}
 	e.jobsMu.Lock()
 	e.jobs[id] = entry
 	e.jobsMu.Unlock()
+	e.operations.mu.Lock()
+	tracked.cancel = cancel
+	e.operations.mu.Unlock()
 	go e.runJob(jobContext, entry, request)
 	return e.jobResult(entry, request.TailLines, false)
 }
 
 func (e *Engine) runJob(ctx context.Context, entry *job, request commandRequest) {
+	defer func() {
+		if op := currentOperation(ctx); op != nil {
+			entry.mu.RLock()
+			status := entry.Status
+			entry.mu.RUnlock()
+			e.operations.finish(op, status)
+		}
+	}()
 	defer close(entry.done)
 	defer entry.heavyLease.Release()
+	if ctx.Err() != nil {
+		entry.mu.Lock()
+		entry.Status = "cancelled"
+		entry.FinishedAt = time.Now().UTC()
+		entry.mu.Unlock()
+		return
+	}
 	store, storeErr := e.artifactStore()
 	if storeErr != nil {
 		entry.mu.Lock()
+		if op := currentOperation(ctx); op != nil {
+			e.operations.finish(op, "failed")
+		}
 		entry.Status = "failed"
 		entry.TerminationReason = "output_persistence_failed"
 		entry.FinishedAt = time.Now()
@@ -579,16 +638,22 @@ func (e *Engine) runJob(ctx context.Context, entry *job, request commandRequest)
 	capture, captureErr := newCommandCapture(e.settings.CommandJobsDir, entry.LogID, request.MaxOutput, store)
 	if captureErr != nil {
 		entry.mu.Lock()
+		if op := currentOperation(ctx); op != nil {
+			e.operations.finish(op, "failed")
+		}
 		entry.Status, entry.Stderr, entry.FinishedAt = "failed", captureErr.Error(), time.Now().UTC()
 		entry.TerminationReason = "output_persistence_failed"
 		entry.mu.Unlock()
 		return
 	}
-	e.writeCommandAudit("start", entry.LogID, "start_command_job", entry.Command, entry.CWD, 0, 0, 0, "running")
+	e.writeCommandAuditContext(ctx, "start", entry.LogID, "start_command_job", entry.Command, entry.CWD, 0, 0, 0, "running")
 	bash := bashBinary()
 	if bash == "" {
 		_ = capture.Close()
 		entry.mu.Lock()
+		if op := currentOperation(ctx); op != nil {
+			e.operations.finish(op, "failed")
+		}
 		entry.Status, entry.Stderr, entry.FinishedAt = "failed", "bash is required", time.Now().UTC()
 		entry.mu.Unlock()
 		return
@@ -607,9 +672,19 @@ func (e *Engine) runJob(ctx context.Context, entry *job, request commandRequest)
 	}
 	configureProcessGroup(process)
 	process.Stdout, process.Stderr = capture.stdout, capture.stderr
+	if ctx.Err() != nil {
+		_ = capture.Close()
+		entry.mu.Lock()
+		entry.Status = "cancelled"
+		entry.FinishedAt = time.Now().UTC()
+		entry.mu.Unlock()
+		return
+	}
 	err := process.Start()
 	if err == nil {
 		entry.mu.Lock()
+		e.operationProcess(ctx, process.Process.Pid)
+		defer e.operationProcess(ctx, 0)
 		entry.pid = process.Process.Pid
 		entry.pgid = process.Process.Pid
 		entry.mu.Unlock()
@@ -639,9 +714,12 @@ func (e *Engine) runJob(ctx context.Context, entry *job, request commandRequest)
 	// terminal state, so publishing completion first races with log creation.
 	if closeErr := capture.Close(); closeErr != nil {
 		entry.mu.Lock()
+		if op := currentOperation(ctx); op != nil {
+			e.operations.finish(op, "failed")
+		}
 		entry.Status, entry.TerminationReason, entry.FinishedAt = "failed", "output_persistence_failed", time.Now().UTC()
 		entry.mu.Unlock()
-		e.writeCommandAudit("finish", entry.LogID, "start_command_job", entry.Command, entry.CWD, time.Since(entry.StartedAt), capture.stdout.Total(), capture.stderr.Total(), "failed")
+		e.writeCommandAuditContext(ctx, "finish", entry.LogID, "start_command_job", entry.Command, entry.CWD, time.Since(entry.StartedAt), capture.stdout.Total(), capture.stderr.Total(), "failed")
 		return
 	}
 	entry.mu.Lock()
@@ -670,24 +748,24 @@ func (e *Engine) runJob(ctx context.Context, entry *job, request commandRequest)
 	entry.mu.Unlock()
 	e.writeCommandMetadata(entry.LogID, entry.Command, entry.CWD, exitCode)
 
+	status, reason := "completed", "completed"
+	if ctx.Err() == context.Canceled {
+		status, reason = "cancelled", "user_cancel"
+	} else if timedOut {
+		status, reason = "timed_out", "timeout"
+	} else if exitCode != 0 {
+		status, reason = "failed", "nonzero_exit"
+	}
+	e.writeCommandAuditContext(ctx, "finish", entry.LogID, "start_command_job", entry.Command, entry.CWD, time.Since(entry.StartedAt), entry.StdoutBytes, entry.StderrBytes, status)
+	if op := currentOperation(ctx); op != nil {
+		e.operations.finish(op, status)
+	}
 	entry.mu.Lock()
 	entry.FinishedAt = time.Now().UTC()
-	entry.Status = "completed"
-	if ctx.Err() == context.Canceled {
-		entry.Status = "cancelled"
-		entry.TerminationReason = "user_cancel"
-	} else if timedOut {
-		entry.Status = "timed_out"
-		entry.TerminationReason = "timeout"
-	} else if exitCode != 0 {
-		entry.Status = "failed"
-		entry.TerminationReason = "nonzero_exit"
-	} else {
-		entry.TerminationReason = "completed"
-	}
-	status := entry.Status
+	entry.Status = status
+	entry.TerminationReason = reason
 	entry.mu.Unlock()
-	e.writeCommandAudit("finish", entry.LogID, "start_command_job", entry.Command, entry.CWD, time.Since(entry.StartedAt), entry.StdoutBytes, entry.StderrBytes, status)
+
 }
 
 func (e *Engine) findRunningByKey(key string) *job {
@@ -726,7 +804,7 @@ func (e *Engine) jobResult(entry *job, tailLines int, concise bool) map[string]a
 		receipt["applied"].(map[string]any)["source_complete"] = false
 	}
 	result := map[string]any{
-		"ok": entry.Status == "running" || entry.Status == "completed", "job_id": entry.ID,
+		"ok": entry.Status == "running" || entry.Status == "completed", "job_id": entry.ID, "background_operation_id": entry.OperationID,
 		"log_id": entry.LogID, "status": entry.Status, "command": entry.Command,
 		"cwd": e.perimeter.Display(entry.CWD), "exit_code": entry.ExitCode,
 		"started_at": entry.StartedAt.Format(time.RFC3339Nano), "timed_out": entry.TimedOut,
@@ -823,6 +901,7 @@ func (e *Engine) cancelJob(id string) map[string]any {
 		entry.mu.Unlock()
 		return map[string]any{"ok": true, "job_id": id, "status": status, "cancelled": false}
 	}
+	e.noteResourceCancel(id)
 	entry.cancel()
 	entry.CancelRequested = true
 	if entry.pid > 0 {
@@ -854,26 +933,42 @@ func (e *Engine) writeCommandMetadata(id, command, cwd string, exitCode int) {
 	}
 }
 
-func (e *Engine) writeCommandAudit(event, requestID, tool, command, cwd string, duration time.Duration, stdoutBytes, stderrBytes int64, status string) {
+func (e *Engine) appendAudit(payload map[string]any) {
 	commandAuditMu.Lock()
 	defer commandAuditMu.Unlock()
-	fingerprint := sha256.Sum256([]byte(redact(command) + "\x00" + cwd))
-	payload, _ := json.Marshal(map[string]any{
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "event": event,
-		"request_id": requestID, "tool": tool, "args_fingerprint": fmt.Sprintf("%x", fingerprint[:]),
-		"duration_ms": duration.Milliseconds(), "stdout_bytes": stdoutBytes, "stderr_bytes": stderrBytes,
-		"status": status,
-	})
-	if err := os.MkdirAll(filepath.Dir(e.settings.CommandAuditLogPath), 0o700); err != nil {
-		return
-	}
-	rotateAuditLog(e.settings.CommandAuditLogPath, 10*1024*1024, 5)
-	file, err := os.OpenFile(e.settings.CommandAuditLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	_, _ = file.Write(append(payload, '\n'))
-	_ = file.Close()
+	if err := os.MkdirAll(filepath.Dir(e.settings.CommandAuditLogPath), 0700); err != nil {
+		return
+	}
+	rotateAuditLog(e.settings.CommandAuditLogPath, 10*1024*1024, 5)
+	file, err := os.OpenFile(e.settings.CommandAuditLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_, _ = file.Write(append(data, '\n'))
+}
+
+func (e *Engine) writeCommandAudit(event, requestID, tool, command, cwd string, duration time.Duration, stdoutBytes, stderrBytes int64, status string) {
+	e.writeCommandAuditContext(context.Background(), event, requestID, tool, command, cwd, duration, stdoutBytes, stderrBytes, status)
+}
+func (e *Engine) writeCommandAuditContext(ctx context.Context, event, requestID, tool, command, cwd string, duration time.Duration, stdoutBytes, stderrBytes int64, status string) {
+	fingerprint := sha256.Sum256([]byte(redact(command) + "\x00" + cwd))
+	payload := map[string]any{"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "event": event, "request_id": requestID, "tool": tool, "args_fingerprint": fmt.Sprintf("%x", fingerprint[:]), "duration_ms": duration.Milliseconds(), "stdout_bytes": stdoutBytes, "stderr_bytes": stderrBytes, "status": status}
+	if ctx != nil {
+		if op := currentOperation(ctx); op != nil {
+			payload["operation_id"] = op.id
+			payload["server_instance_id"] = e.operations.instanceID
+			payload["session_id"] = op.identity.SessionID
+			if op.parent != nil {
+				payload["parent_operation_id"] = op.parent.id
+			}
+		}
+	}
+	e.appendAudit(payload)
 }
 
 func rotateAuditLog(path string, maximum int64, keep int) {

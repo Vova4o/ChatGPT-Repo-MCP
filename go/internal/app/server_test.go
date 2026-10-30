@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestServerListsCanonicalToolsAndCallsOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Tools) != 94 {
+	if len(listed.Tools) != 97 {
 		t.Fatalf("tools = %d", len(listed.Tools))
 	}
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "list_repos", Arguments: map[string]any{}})
@@ -159,5 +160,76 @@ func TestFileTransferToolMetadataAndResourceRoundTrip(t *testing.T) {
 	}
 	if len(resource.Contents) != 1 || string(resource.Contents[0].Blob) != string(payload) {
 		t.Fatalf("resource = %#v", resource.Contents)
+	}
+}
+
+func TestComputerToolRegistrationGates(t *testing.T) {
+	ctx := context.Background()
+
+	listNames := func(settings config.Settings) map[string]bool {
+		application, err := New(settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverTransport, clientTransport := mcp.NewInMemoryTransports()
+		if _, err := application.Server.Connect(ctx, serverTransport, nil); err != nil {
+			t.Fatal(err)
+		}
+		client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil)
+		session, err := client.Connect(ctx, clientTransport, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		listed, err := session.ListTools(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := make(map[string]bool, len(listed.Tools))
+		for _, tool := range listed.Tools {
+			names[tool.Name] = true
+		}
+		return names
+	}
+
+	settings := appSettings(t.TempDir())
+	settings.ComputerUseEnabled = true
+	eyes := listNames(settings)
+	for _, name := range []string{
+		"computer_status", "computer_observe", "computer_share_snapshot", "computer_zoom",
+		"computer_windows", "computer_elements", "computer_wait",
+	} {
+		if !eyes[name] {
+			t.Fatalf("read-only computer tool %q missing", name)
+		}
+	}
+	if eyes["computer_click"] || eyes["computer_type"] || eyes["computer_move"] {
+		t.Fatal("control tools registered while COMPUTER_CONTROL_ENABLED=false")
+	}
+	if got := len(eyes); got != 104 {
+		t.Fatalf("safe + computer eyes tools = %d, want 104", got)
+	}
+
+	settings = appSettings(t.TempDir())
+	settings.AccessMode = "full"
+	settings.EnablePTY = true
+	settings.ComputerUseEnabled = true
+	settings.ComputerControlEnabled = true
+	full := listNames(settings)
+	for _, name := range []string{
+		"computer_click", "computer_move", "computer_type", "computer_key",
+		"computer_scroll", "computer_drag", "computer_window", "computer_launch",
+		"computer_element", "computer_sequence",
+	} {
+		if !full[name] {
+			t.Fatalf("full computer control tool %q missing", name)
+		}
+	}
+	want := 120
+	if runtime.GOOS == "windows" {
+		want = 114
+	}
+	if got := len(full); got != want {
+		t.Fatalf("full computer tool count = %d, want %d", got, want)
 	}
 }

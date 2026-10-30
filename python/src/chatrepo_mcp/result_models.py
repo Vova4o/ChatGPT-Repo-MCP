@@ -40,6 +40,29 @@ TOOL_SUCCESS_SPECS: dict[str, tuple[ToolSuccessSpec, ...]] = {
     "file_metadata": ((False, ("path", "exists", "type", "name", "suffix")),),
     "receive_chat_file": ((True, ("path", "file_id", "file_name", "mime_type", "size_bytes", "sha256", "dry_run")),),
     "export_file_to_chat": ((True, ("path", "name", "mime_type", "size_bytes", "sha256", "resource_uri")),),
+    "computer_status": ((True, ("platform", "session", "backend", "capture", "control")),),
+    "computer_observe": ((True, ("snapshot_id", "mime_type", "image_width", "image_height", "bounds", "scene")),),
+    "computer_share_snapshot": ((True, ("snapshot_id", "name", "mime_type", "size_bytes", "resource_uri", "expires_at")),),
+    "computer_zoom": ((True, ("snapshot_id", "mime_type", "image_width", "image_height", "bounds", "scene")),),
+    "computer_windows": ((True, ("windows",)),),
+    "computer_elements": ((True, ("elements",)),),
+    "computer_wait": ((True, ("met",)),),
+    "computer_element": (
+        (True, ("snapshot_id", "scene")),
+        (True, ("element",)),
+    ),
+    "computer_click": ((True, ("snapshot_id", "scene", "verification")),),
+    "computer_move": ((True, ("snapshot_id", "scene", "verification")),),
+    "computer_type": ((True, ("snapshot_id", "scene", "verification")),),
+    "computer_key": ((True, ("snapshot_id", "scene", "verification")),),
+    "computer_scroll": ((True, ("snapshot_id", "scene", "verification")),),
+    "computer_drag": ((True, ("snapshot_id", "scene", "verification")),),
+    "computer_window": ((True, ("snapshot_id", "scene")),),
+    "computer_launch": ((True, ("snapshot_id", "scene")),),
+    "computer_sequence": (
+        (True, ("sequence_results",)),
+        (True, ("snapshot_id", "scene", "sequence_results")),
+    ),
     "find_files": ((False, ("pattern", "path", "matches", "count")), (True, ("pattern", "matches", "count", "truncated"))),
     "search_text": (
         (False, ("query", "path", "results", "count", "mode")),
@@ -100,6 +123,9 @@ TOOL_SUCCESS_SPECS: dict[str, tuple[ToolSuccessSpec, ...]] = {
     "get_command_job": ((True, ("job_id", "status")),),
     "get_job_status": ((True, ("job_id", "status")),),
     "list_command_jobs": ((True, ("jobs", "count")),),
+    "list_operations": ((True, ("server_instance_id", "scope", "operations", "count", "total", "truncated")),),
+    "get_operation": ((True, ("operation",)),),
+    "cancel_operation": ((True, ("operation_id", "cancel_requested", "status")),),
     "list_heavy_operations": ((True, ("capacity", "used", "operations")),),
     "cancel_heavy_operation": ((True, ("operation_id", "cancel_requested")),),
     "cancel_command_job": ((True, ("job_id", "status", "cancelled")),),
@@ -144,6 +170,7 @@ TOOL_SUCCESS_SPECS: dict[str, tuple[ToolSuccessSpec, ...]] = {
 
 
 _FIELD_TYPES: dict[str, Any] = {
+    "server_instance_id": str, "scope": str, "operation": dict[str, Any], "total": int,
     "project_root": str, "exists": bool, "is_dir": bool, "config": dict[str, Any], "path": str,
     "entries": list[Any] | int, "truncated": bool, "tree": str, "max_entries": int, "start_line": int,
     "end_line": int, "content": str, "line_count": int, "total_lines": int, "sha256": str, "files": list[Any], "type": str,
@@ -173,6 +200,10 @@ _FIELD_TYPES: dict[str, Any] = {
     "capabilities": dict[str, Any], "normalized": str, "policy_mode": str, "output": str,
     "receipt": dict[str, Any], "file_id": str, "file_name": str, "mime_type": str,
     "size_bytes": int, "resource_uri": str,
+    "platform": str, "session": str, "backend": str, "capture": bool, "control": bool,
+    "snapshot_id": str, "image_width": int, "image_height": int, "bounds": dict[str, Any],
+    "scene": dict[str, Any], "windows": list[Any], "elements": list[Any], "element": dict[str, Any],
+    "met": bool, "sequence_results": list[Any], "failed_step": int, "verification": dict[str, Any],
 }
 
 
@@ -195,6 +226,9 @@ def _summary_properties(specs: tuple[ToolSuccessSpec, ...]) -> dict[str, Any]:
         "ok": {"type": "boolean"},
         "error_kind": {"type": "string"},
         "error": {},
+        "tracking_operation_id": {"type": "string"},
+        "background_operation_id": {"type": ["string", "null"]},
+        "operation_id": {"type": "string"},
     }
     for _, core in specs:
         for field in core:

@@ -44,17 +44,17 @@ func (e *Engine) executeReadTool(ctx context.Context, name string, args map[stri
 	case "repo_info":
 		return e.repoInfo(ctx, stringArg(args, "repo", ""))
 	case "list_dir":
-		return e.listDirectory(stringArg(args, "path", "."), boolArg(args, "include_hidden", true), intArg(args, "limit", 200))
+		return e.listDirectoryContext(ctx, stringArg(args, "path", "."), boolArg(args, "include_hidden", true), intArg(args, "limit", 200))
 	case "tree":
-		return e.directoryTree(stringArg(args, "path", "."), intArg(args, "depth", 4), boolArg(args, "include_hidden", true))
+		return e.directoryTreeContext(ctx, stringArg(args, "path", "."), intArg(args, "depth", 4), boolArg(args, "include_hidden", true))
 	case "read_text_file":
-		return e.readText(stringArg(args, "path", ""), intArg(args, "start_line", 1), intArg(args, "end_line", 0), boolArg(args, "with_line_numbers", true))
+		return e.readTextContext(ctx, stringArg(args, "path", ""), intArg(args, "start_line", 1), intArg(args, "end_line", 0), boolArg(args, "with_line_numbers", true))
 	case "read_multiple_files":
-		return e.readMultiple(stringSliceArg(args, "paths"))
+		return e.readMultipleContext(ctx, stringSliceArg(args, "paths"))
 	case "file_metadata":
-		return e.fileMetadata(stringArg(args, "path", ""), boolArg(args, "include_stat", true))
+		return e.fileMetadataContext(ctx, stringArg(args, "path", ""), boolArg(args, "include_stat", true))
 	case "find_files":
-		return e.findFiles(stringArg(args, "pattern", "*"), stringArg(args, "path", "."), boolArg(args, "include_hidden", true), intArg(args, "limit", 200))
+		return e.findFilesContext(ctx, stringArg(args, "pattern", "*"), stringArg(args, "path", "."), boolArg(args, "include_hidden", true), intArg(args, "limit", 200))
 	case "search_text":
 		if mode := stringArg(args, "mode", "quick"); mode == "exhaustive" {
 			return e.startExhaustiveSearch(ctx, args)
@@ -69,9 +69,12 @@ func (e *Engine) executeReadTool(ctx context.Context, name string, args map[stri
 	case "todo_scan":
 		return e.searchText(ctx, `\b(TODO|FIXME|HACK|XXX)\b`, stringArg(args, "path", "."), stringSliceArg(args, "paths"), true, false, intArg(args, "limit", 100))
 	case "dependency_map":
-		return e.dependencyMap(stringArg(args, "path", "."))
+		return e.dependencyMapContext(ctx, stringArg(args, "path", "."))
 	case "list_repos":
 		entries := e.workspaceEntries(ctx)
+		if ctx.Err() != nil {
+			return failure("operation_cancelled", ctx.Err().Error())
+		}
 		return map[string]any{"ok": true, "repos": entries, "count": len(entries)}
 	case "list_heavy_operations":
 		return e.listHeavyOperations()
@@ -88,7 +91,7 @@ func (e *Engine) executeReadTool(ctx context.Context, name string, args map[stri
 	case "symbol_definition":
 		return e.symbolDefinition(ctx, args)
 	case "document_symbols":
-		return e.documentSymbols(stringArg(args, "path", ""))
+		return e.documentSymbolsContext(ctx, stringArg(args, "path", ""))
 	case "workspace_symbols":
 		return e.workspaceSymbols(ctx, args)
 	default:
@@ -161,6 +164,11 @@ func (e *Engine) repoInfo(ctx context.Context, repo string) map[string]any {
 			"max_file_bytes": e.settings.MaxFileBytes, "max_response_chars": e.settings.MaxResponseChars,
 			"max_read_files": e.settings.MaxReadFiles, "max_search_results": e.settings.MaxSearchResults,
 			"file_transfer_import_max_bytes": e.settings.FileTransferImportMaxBytes, "file_transfer_export_max_bytes": e.settings.FileTransferExportMaxBytes,
+			"computer_use_enabled": e.settings.ComputerUseEnabled, "computer_control_enabled": e.settings.ComputerControlEnabled,
+			"computer_snapshot_ttl_seconds": int(e.settings.ComputerSnapshotTTL.Seconds()), "computer_action_timeout_ms": int(e.settings.ComputerActionTimeout.Milliseconds()),
+			"computer_idle_timeout_seconds": int(e.settings.ComputerIdleTimeout.Seconds()),
+			"computer_max_sequence_steps":   e.settings.ComputerMaxSequenceSteps, "computer_capture_max_edge": e.settings.ComputerCaptureMaxEdge,
+			"maintenance_enabled": e.settings.MaintenanceEnabled, "maintenance_interval_seconds": int(e.settings.MaintenanceInterval.Seconds()), "audit_log_ttl_seconds": int(e.settings.AuditLogTTL.Seconds()),
 			"max_tree_entries": e.settings.MaxTreeEntries, "blocked_globs": e.settings.BlockedGlobs,
 			"resource_profile": e.settings.ResourceProfile, "resource_profile_applied": e.settings.ResourceProfileApplied, "resource_buffer_bytes": e.settings.ResourceBufferBytes,
 			"resource_buffer_enforced": false, "resource_buffer_semantics": "diagnostic_estimate_only",
@@ -173,6 +181,9 @@ func (e *Engine) repoInfo(ctx context.Context, repo string) map[string]any {
 	} else {
 		result["git_error"] = err.Error()
 		entries := e.workspaceEntries(ctx)
+		if ctx.Err() != nil {
+			return failure("operation_cancelled", ctx.Err().Error())
+		}
 		if len(entries) > 0 {
 			result["git"] = map[string]any{"polyrepo": true, "repos": entries}
 		}
@@ -181,6 +192,12 @@ func (e *Engine) repoInfo(ctx context.Context, repo string) map[string]any {
 }
 
 func (e *Engine) listDirectory(path string, includeHidden bool, limit int) map[string]any {
+	return e.listDirectoryContext(context.Background(), path, includeHidden, limit)
+}
+func (e *Engine) listDirectoryContext(ctx context.Context, path string, includeHidden bool, limit int) map[string]any {
+	if err := e.operationCheckpoint(ctx, "reading", 0, 0); err != nil {
+		return failure("operation_cancelled", err.Error())
+	}
 	resolved, err := e.perimeter.Resolve(path, includeHidden, false)
 	if err != nil {
 		return withError("path_not_allowed", err)
@@ -198,6 +215,9 @@ func (e *Engine) listDirectory(path string, includeHidden bool, limit int) map[s
 	limit = min(max(limit, 0), e.settings.MaxTreeEntries)
 	result := make([]map[string]any, 0, min(len(entries), limit))
 	for _, entry := range entries {
+		if e.operationCheckpoint(ctx, "listing", 1, 0) != nil {
+			return failure("operation_cancelled", ctx.Err().Error())
+		}
 		child := filepath.Join(resolved.Absolute, entry.Name())
 		childRel := filepath.ToSlash(filepath.Join(resolved.Relative, entry.Name()))
 		if e.perimeter.IsBlocked(childRel) || (!includeHidden && strings.HasPrefix(entry.Name(), ".")) {
@@ -225,10 +245,16 @@ func (e *Engine) listDirectory(path string, includeHidden bool, limit int) map[s
 		}
 		result = append(result, item)
 	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	return map[string]any{"ok": true, "path": e.perimeter.Display(resolved.Absolute), "entries": result, "truncated": len(result) < len(entries)}
 }
 
 func (e *Engine) directoryTree(path string, depth int, includeHidden bool) map[string]any {
+	return e.directoryTreeContext(context.Background(), path, depth, includeHidden)
+}
+func (e *Engine) directoryTreeContext(ctx context.Context, path string, depth int, includeHidden bool) map[string]any {
 	resolved, err := e.perimeter.Resolve(path, includeHidden, false)
 	if err != nil {
 		return withError("path_not_allowed", err)
@@ -240,6 +266,9 @@ func (e *Engine) directoryTree(path string, depth int, includeHidden bool) map[s
 	count := 0
 	var walk func(string, string, int)
 	walk = func(directory, prefix string, remaining int) {
+		if e.operationCheckpoint(ctx, "walking", 0, 1) != nil {
+			return
+		}
 		if remaining == 0 || count >= e.settings.MaxTreeEntries {
 			return
 		}
@@ -250,6 +279,13 @@ func (e *Engine) directoryTree(path string, depth int, includeHidden bool) map[s
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 		visible := make([]os.DirEntry, 0, len(entries))
 		for _, entry := range entries {
+			files := int64(1)
+			if entry.IsDir() {
+				files = 0
+			}
+			if e.operationCheckpoint(ctx, "walking", files, 0) != nil {
+				return
+			}
 			child := filepath.Join(directory, entry.Name())
 			if (!includeHidden && strings.HasPrefix(entry.Name(), ".")) || e.perimeter.IsBlocked(e.perimeter.Display(child)) {
 				continue
@@ -259,6 +295,9 @@ func (e *Engine) directoryTree(path string, depth int, includeHidden bool) map[s
 			}
 		}
 		for index, entry := range visible {
+			if ctx.Err() != nil {
+				return
+			}
 			if count >= e.settings.MaxTreeEntries {
 				return
 			}
@@ -281,10 +320,19 @@ func (e *Engine) directoryTree(path string, depth int, includeHidden bool) map[s
 		}
 	}
 	walk(resolved.Absolute, "", depth)
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	return map[string]any{"ok": true, "path": e.perimeter.Display(resolved.Absolute), "tree": strings.Join(lines, "\n"), "entries": count, "truncated": count >= e.settings.MaxTreeEntries}
 }
 
 func (e *Engine) readText(path string, startLine, endLine int, withNumbers bool) map[string]any {
+	return e.readTextContext(context.Background(), path, startLine, endLine, withNumbers)
+}
+func (e *Engine) readTextContext(ctx context.Context, path string, startLine, endLine int, withNumbers bool) map[string]any {
+	if err := e.operationCheckpoint(ctx, "reading", 0, 0); err != nil {
+		return failure("operation_cancelled", err.Error())
+	}
 	resolved, err := e.perimeter.Resolve(path, true, false)
 	if err != nil {
 		return withError("path_not_allowed", err)
@@ -296,7 +344,7 @@ func (e *Engine) readText(path string, startLine, endLine int, withNumbers bool)
 	if info.Size() > e.settings.MaxFileBytes {
 		return failure("file_too_large", fmt.Sprintf("file exceeds MAX_FILE_BYTES (%d > %d)", info.Size(), e.settings.MaxFileBytes))
 	}
-	data, err := os.ReadFile(resolved.Absolute)
+	data, err := e.readBytesContext(ctx, resolved.Absolute)
 	if err != nil {
 		return withError("read_failed", err)
 	}
@@ -327,6 +375,9 @@ func (e *Engine) readText(path string, startLine, endLine int, withNumbers bool)
 	if withNumbers {
 		width := len(strconv.Itoa(max(endLine, 1)))
 		for index := range selected {
+			if ctx.Err() != nil {
+				return failure("operation_cancelled", ctx.Err().Error())
+			}
 			selected[index] = fmt.Sprintf("%*d: %s", width, startLine+index, selected[index])
 		}
 	}
@@ -340,17 +391,35 @@ func (e *Engine) readText(path string, startLine, endLine int, withNumbers bool)
 }
 
 func (e *Engine) readMultiple(paths []string) map[string]any {
+	return e.readMultipleContext(context.Background(), paths)
+}
+func (e *Engine) readMultipleContext(ctx context.Context, paths []string) map[string]any {
+	if err := e.operationCheckpoint(ctx, "reading", 0, 0); err != nil {
+		return failure("operation_cancelled", err.Error())
+	}
 	if len(paths) > e.settings.MaxReadFiles {
 		return failure("too_many_files", fmt.Sprintf("requested %d files; maximum is %d", len(paths), e.settings.MaxReadFiles))
 	}
 	files := make([]map[string]any, 0, len(paths))
 	for _, path := range paths {
-		files = append(files, e.readText(path, 1, 0, false))
+		if ctx.Err() != nil {
+			return failure("operation_cancelled", ctx.Err().Error())
+		}
+		files = append(files, e.readTextContext(ctx, path, 1, 0, false))
+	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
 	}
 	return map[string]any{"ok": true, "files": files, "count": len(files)}
 }
 
 func (e *Engine) fileMetadata(path string, includeStat bool) map[string]any {
+	return e.fileMetadataContext(context.Background(), path, includeStat)
+}
+func (e *Engine) fileMetadataContext(ctx context.Context, path string, includeStat bool) map[string]any {
+	if err := e.operationCheckpoint(ctx, "reading", 0, 0); err != nil {
+		return failure("operation_cancelled", err.Error())
+	}
 	resolved, err := e.perimeter.Resolve(path, true, false)
 	if err != nil {
 		return withError("path_not_allowed", err)
@@ -365,7 +434,7 @@ func (e *Engine) fileMetadata(path string, includeStat bool) map[string]any {
 		"modified": info.ModTime().UTC().Format(time.RFC3339Nano),
 	}
 	if info.Mode().IsRegular() && info.Size() <= e.settings.MaxFileBytes {
-		if data, readErr := os.ReadFile(resolved.Absolute); readErr == nil {
+		if data, readErr := e.readBytesContext(ctx, resolved.Absolute); readErr == nil {
 			digest := sha256.Sum256(data)
 			result["sha256"] = hex.EncodeToString(digest[:])
 		}
@@ -373,6 +442,9 @@ func (e *Engine) fileMetadata(path string, includeStat bool) map[string]any {
 	if !includeStat {
 		delete(result, "mode")
 		delete(result, "modified")
+	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
 	}
 	return result
 }
@@ -388,6 +460,9 @@ func fileType(info os.FileInfo) string {
 }
 
 func (e *Engine) findFiles(pattern, path string, includeHidden bool, limit int) map[string]any {
+	return e.findFilesContext(context.Background(), pattern, path, includeHidden, limit)
+}
+func (e *Engine) findFilesContext(ctx context.Context, pattern, path string, includeHidden bool, limit int) map[string]any {
 	resolved, err := e.perimeter.Resolve(path, includeHidden, false)
 	if err != nil {
 		return withError("path_not_allowed", err)
@@ -396,6 +471,16 @@ func (e *Engine) findFiles(pattern, path string, includeHidden bool, limit int) 
 	var matches []map[string]any
 	truncated := false
 	_ = filepath.WalkDir(resolved.Absolute, func(current string, entry os.DirEntry, walkErr error) error {
+		if ctx.Err() != nil {
+			return filepath.SkipAll
+		}
+		if entry != nil {
+			if entry.IsDir() {
+				_ = e.operationCheckpoint(ctx, "walking", 0, 1)
+			} else {
+				_ = e.operationCheckpoint(ctx, "walking", 1, 0)
+			}
+		}
 		if walkErr != nil {
 			return nil
 		}
@@ -430,6 +515,9 @@ func (e *Engine) findFiles(pattern, path string, includeHidden bool, limit int) 
 		}
 		return nil
 	})
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	return map[string]any{"ok": true, "pattern": pattern, "matches": matches, "count": len(matches), "truncated": truncated}
 }
 
@@ -451,7 +539,7 @@ func (e *Engine) searchText(ctx context.Context, query, path string, paths []str
 		resolvedTargets = append(resolvedTargets, resolved.Absolute)
 	}
 	requestID := randomID()
-	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: "search_text", CWD: strings.Join(resolvedTargets, ","), RequestID: requestID})
+	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: "search_text", CWD: strings.Join(resolvedTargets, ","), RequestID: requestID, Context: ctx})
 	if !acquired {
 		return e.heavyBusyResult()
 	}
@@ -462,7 +550,7 @@ func (e *Engine) searchText(ctx context.Context, query, path string, paths []str
 	if _, err := exec.LookPath("rg"); err == nil {
 		return e.searchWithRipgrep(searchContext, query, resolvedTargets, regexMode, caseSensitive, limit)
 	}
-	return e.searchFallback(query, resolvedTargets, regexMode, caseSensitive, limit)
+	return e.searchFallbackContext(searchContext, query, resolvedTargets, regexMode, caseSensitive, limit)
 }
 
 func (e *Engine) searchWithRipgrep(ctx context.Context, query string, targets []string, regexMode, caseSensitive bool, limit int) map[string]any {
@@ -484,11 +572,11 @@ func (e *Engine) searchWithRipgrep(ctx context.Context, query string, targets []
 	command := exec.CommandContext(ctx, "rg", arguments...)
 	requestID := randomID()
 	started := time.Now()
-	e.writeCommandAudit("start", requestID, "search_text", "rg search", strings.Join(targets, ","), 0, 0, 0, "running")
+	e.writeCommandAuditContext(ctx, "start", requestID, "search_text", "rg search", strings.Join(targets, ","), 0, 0, 0, "running")
 	auditStatus := "failed"
 	var auditReturned int64
 	defer func() {
-		e.writeCommandAudit("finish", requestID, "search_text", "rg search", strings.Join(targets, ","), time.Since(started), auditReturned, 0, auditStatus)
+		e.writeCommandAuditContext(ctx, "finish", requestID, "search_text", "rg search", strings.Join(targets, ","), time.Since(started), auditReturned, 0, auditStatus)
 	}()
 	configureProcessGroup(command)
 	stdout, err := command.StdoutPipe()
@@ -497,9 +585,15 @@ func (e *Engine) searchWithRipgrep(ctx context.Context, query string, targets []
 	}
 	stderr := newMemoryStreamCapture(64 * 1024)
 	command.Stderr = stderr
+	if ctx.Err() != nil {
+		_ = stdout.Close()
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	if err := command.Start(); err != nil {
 		return withError("search_failed", err)
 	}
+	e.operationProcess(ctx, command.Process.Pid)
+	defer e.operationProcess(ctx, 0)
 	results := make([]map[string]any, 0, min(limit, 64))
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
@@ -550,10 +644,16 @@ func (e *Engine) searchWithRipgrep(ctx context.Context, query string, targets []
 	if truncated {
 		receipt["reason"] = "result_limit"
 	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	return map[string]any{"ok": true, "query": query, "matches": results, "count": len(results), "truncated": truncated, "engine": "ripgrep", "receipt": receipt}
 }
 
 func (e *Engine) searchFallback(query string, targets []string, regexMode, caseSensitive bool, limit int) map[string]any {
+	return e.searchFallbackContext(context.Background(), query, targets, regexMode, caseSensitive, limit)
+}
+func (e *Engine) searchFallbackContext(ctx context.Context, query string, targets []string, regexMode, caseSensitive bool, limit int) map[string]any {
 	expression := regexp.QuoteMeta(query)
 	if regexMode {
 		expression = query
@@ -568,6 +668,16 @@ func (e *Engine) searchFallback(query string, targets []string, regexMode, caseS
 	var results []map[string]any
 	for _, target := range targets {
 		_ = filepath.WalkDir(target, func(path string, entry os.DirEntry, walkErr error) error {
+			if ctx.Err() != nil {
+				return filepath.SkipAll
+			}
+			if entry != nil {
+				if entry.IsDir() {
+					_ = e.operationCheckpoint(ctx, "walking", 0, 1)
+				} else {
+					_ = e.operationCheckpoint(ctx, "walking", 1, 0)
+				}
+			}
 			if walkErr != nil || len(results) >= limit {
 				return filepath.SkipAll
 			}
@@ -588,6 +698,9 @@ func (e *Engine) searchFallback(query string, targets []string, regexMode, caseS
 			scanner := bufio.NewScanner(io.LimitReader(file, e.settings.MaxFileBytes))
 			line := 0
 			for scanner.Scan() && len(results) < limit {
+				if ctx.Err() != nil {
+					return filepath.SkipAll
+				}
 				line++
 				if compiled.MatchString(scanner.Text()) {
 					results = append(results, map[string]any{"path": e.perimeter.Display(path), "line": line, "text": scanner.Text()})
@@ -596,11 +709,13 @@ func (e *Engine) searchFallback(query string, targets []string, regexMode, caseS
 			return nil
 		})
 	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	return map[string]any{"ok": true, "query": query, "matches": results, "count": len(results), "truncated": len(results) >= limit, "engine": "go-fallback"}
 }
 
 func (e *Engine) recentChanges(ctx context.Context, path string, paths []string, limit int) map[string]any {
-	_ = ctx
 	limit = min(max(limit, 0), e.settings.MaxSearchResults)
 	targets := paths
 	if len(targets) == 0 {
@@ -614,6 +729,16 @@ func (e *Engine) recentChanges(ctx context.Context, path string, paths []string,
 			return withError("path_not_allowed", err)
 		}
 		_ = filepath.WalkDir(resolved.Absolute, func(item string, entry os.DirEntry, walkErr error) error {
+			if ctx.Err() != nil {
+				return filepath.SkipAll
+			}
+			if entry != nil {
+				if entry.IsDir() {
+					_ = e.operationCheckpoint(ctx, "walking", 0, 1)
+				} else {
+					_ = e.operationCheckpoint(ctx, "walking", 1, 0)
+				}
+			}
 			if walkErr != nil {
 				return nil
 			}
@@ -651,16 +776,22 @@ func (e *Engine) recentChanges(ctx context.Context, path string, paths []string,
 	for _, item := range ordered {
 		files = append(files, map[string]any{"path": e.perimeter.Display(item.path), "mtime": float64(item.mod.UnixNano()) / 1e9, "size": item.size})
 	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
+	}
 	return map[string]any{"ok": true, "path": path, "paths": paths, "files": files, "count": len(files)}
 }
 
 func (e *Engine) dependencyMap(path string) map[string]any {
+	return e.dependencyMapContext(context.Background(), path)
+}
+func (e *Engine) dependencyMapContext(ctx context.Context, path string) map[string]any {
 	directory, err := e.resolveDirectory(path, true)
 	if err != nil {
 		return withError("path_not_allowed", err)
 	}
 	dependencies := make(map[string]any)
-	if data, readErr := readFileLimited(filepath.Join(directory, "package.json"), e.settings.MaxFileBytes); readErr == nil {
+	if data, readErr := e.readBytesContext(ctx, filepath.Join(directory, "package.json")); readErr == nil {
 		var packageJSON map[string]any
 		if json.Unmarshal(data, &packageJSON) == nil {
 			dependencies["node"] = map[string]any{"dependencies": packageJSON["dependencies"], "devDependencies": packageJSON["devDependencies"]}
@@ -671,6 +802,9 @@ func (e *Engine) dependencyMap(path string) map[string]any {
 		var modules []string
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
+			if ctx.Err() != nil {
+				return failure("operation_cancelled", ctx.Err().Error())
+			}
 			line := strings.TrimSpace(scanner.Text())
 			fields := strings.Fields(line)
 			if len(fields) >= 2 && fields[0] != "module" && fields[0] != "go" && fields[0] != "require" && !strings.HasPrefix(fields[0], "//") {
@@ -679,9 +813,12 @@ func (e *Engine) dependencyMap(path string) map[string]any {
 		}
 		dependencies["go"] = modules
 	}
-	if data, readErr := readFileLimited(filepath.Join(directory, "requirements.txt"), e.settings.MaxFileBytes); readErr == nil {
+	if data, readErr := e.readBytesContext(ctx, filepath.Join(directory, "requirements.txt")); readErr == nil {
 		var requirements []string
 		for _, line := range strings.Split(string(data), "\n") {
+			if ctx.Err() != nil {
+				return failure("operation_cancelled", ctx.Err().Error())
+			}
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") {
 				requirements = append(requirements, line)
@@ -693,6 +830,9 @@ func (e *Engine) dependencyMap(path string) map[string]any {
 	}
 	if _, statErr := os.Stat(filepath.Join(directory, "Cargo.toml")); statErr == nil {
 		dependencies["rust"] = map[string]any{"manifest": "Cargo.toml"}
+	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
 	}
 	return map[string]any{"ok": true, "path": e.perimeter.Display(directory), "stack": detectStack(directory), "dependencies": dependencies}
 }
@@ -717,6 +857,9 @@ func (e *Engine) doctor(ctx context.Context) map[string]any {
 	storage := e.artifactStorageHealth(ctx)
 	capabilities := map[string]any{}
 	for _, name := range []string{"git", "rg", "gh", "ctags", "bash", "go", "python3", "node", "ruff", "mypy", "pyright"} {
+		if e.operationCheckpoint(ctx, "diagnostics", 0, 0) != nil {
+			return failure("operation_cancelled", "Diagnostics cancelled")
+		}
 		capabilities[name] = e.toolStatus(name)
 	}
 	entries, warnings := e.effectivePath()
@@ -734,6 +877,16 @@ func (e *Engine) doctor(ctx context.Context) map[string]any {
 			return "POSIX PTY is unavailable on this platform"
 		}(),
 	}
+	if e.settings.ComputerUseEnabled {
+		computerStatus := e.executeComputerTool(ctx, "computer_status", map[string]any{})
+		computerStatus["enabled"] = true
+		computerStatus["control_enabled"] = e.settings.ComputerControlEnabled
+		capabilities["computer"] = computerStatus
+	} else {
+		capabilities["computer"] = map[string]any{
+			"ok": true, "enabled": false, "control_enabled": false, "reason": "COMPUTER_USE_ENABLED=false",
+		}
+	}
 	capabilities["subagents"] = map[string]any{"available": false, "enabled": false, "reason": "No executor configured in V1"}
 	return map[string]any{
 		"ok": storage["ok"], "artifact_storage": storage, "implementation": "go", "tool_count": len(e.toolNames), "tools": e.toolNames,
@@ -747,7 +900,7 @@ func (e *Engine) doctor(ctx context.Context) map[string]any {
 
 func (e *Engine) smokeAll(ctx context.Context) map[string]any {
 	checks := []map[string]any{
-		e.repoInfo(ctx, ""), e.listDirectory(".", true, 5), e.directoryTree(".", 1, true),
+		e.repoInfo(ctx, ""), e.listDirectoryContext(ctx, ".", true, 5), e.directoryTreeContext(ctx, ".", 1, true),
 	}
 	ok := true
 	for _, check := range checks {
@@ -762,10 +915,13 @@ func (e *Engine) contextBootstrap(ctx context.Context) map[string]any {
 	repos := e.workspaceOverview(ctx)
 	result := map[string]any{"ok": true, "repo": e.settings.ProjectRoot, "repos": repos}
 	for _, candidate := range []string{"AGENTS.md", "README.md", "README_RU.md", "docs/CURRENT_TASK.md", "CURRENT_TASK.md"} {
-		if metadata := e.fileMetadata(candidate, false); metadata["ok"] == true {
-			result["context_file"] = e.readText(candidate, 1, 200, false)
+		if metadata := e.fileMetadataContext(ctx, candidate, false); metadata["ok"] == true {
+			result["context_file"] = e.readTextContext(ctx, candidate, 1, 200, false)
 			break
 		}
+	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
 	}
 	return result
 }
@@ -778,6 +934,10 @@ func (e *Engine) batchCall(ctx context.Context, args map[string]any) map[string]
 	results := make([]map[string]any, len(calls))
 	invoke := func(index int, call map[string]any) {
 		name := stringArg(call, "tool", "")
+		if ctx.Err() != nil {
+			results[index] = map[string]any{"index": index, "tool": name, "ok": false, "result": failure("operation_cancelled", "Batch cancelled before starting this call")}
+			return
+		}
 		arguments := mapArg(call, "args")
 		allowed := map[string]bool{"repo_info": true, "list_dir": true, "tree": true, "read_text_file": true, "read_multiple_files": true, "file_metadata": true, "find_files": true, "search_text": true, "symbol_search": true, "recent_changes": true, "todo_scan": true, "dependency_map": true, "git_status": true, "git_diff": true, "git_log": true, "git_show": true, "git_branches": true, "git_blame": true, "git_grep": true}
 		if !allowed[name] {
@@ -887,22 +1047,37 @@ func (e *Engine) symbolDefinition(ctx context.Context, args map[string]any) map[
 	symbol := stringArg(args, "symbol", "")
 	limit := intArg(args, "limit", 20)
 	result := e.searchText(ctx, `\b(?:def|class|func|type|const|var)\s+`+regexp.QuoteMeta(symbol)+`\b`, ".", nil, true, true, limit)
+	if result["ok"] == false {
+		return result
+	}
 	return map[string]any{"ok": result["ok"], "symbol": symbol, "definitions": result["matches"], "engine": result["engine"]}
 }
 
 var symbolLine = regexp.MustCompile(`^\s*(?:def|class|func|type|interface|struct|const|var|function)\s+([A-Za-z_][A-Za-z0-9_]*)`)
 
 func (e *Engine) documentSymbols(path string) map[string]any {
-	read := e.readText(path, 1, 0, false)
+	return e.documentSymbolsContext(context.Background(), path)
+}
+func (e *Engine) documentSymbolsContext(ctx context.Context, path string) map[string]any {
+	if err := e.operationCheckpoint(ctx, "reading", 0, 0); err != nil {
+		return failure("operation_cancelled", err.Error())
+	}
+	read := e.readTextContext(ctx, path, 1, 0, false)
 	content, ok := read["content"].(string)
 	if !ok {
 		return read
 	}
 	var symbols []map[string]any
 	for index, line := range strings.Split(content, "\n") {
+		if e.operationCheckpoint(ctx, "indexing", 0, 0) != nil {
+			return failure("operation_cancelled", ctx.Err().Error())
+		}
 		if match := symbolLine.FindStringSubmatch(line); len(match) > 1 {
 			symbols = append(symbols, map[string]any{"name": match[1], "kind": strings.Fields(strings.TrimSpace(line))[0], "line": index + 1, "signature": strings.TrimSpace(line)})
 		}
+	}
+	if ctx.Err() != nil {
+		return failure("operation_cancelled", ctx.Err().Error())
 	}
 	return map[string]any{"ok": true, "path": read["path"], "symbols": symbols, "engine": "regex"}
 }
@@ -911,6 +1086,9 @@ func (e *Engine) workspaceSymbols(ctx context.Context, args map[string]any) map[
 	query := stringArg(args, "query", "")
 	limit := intArg(args, "limit", 50)
 	result := e.searchText(ctx, query, ".", nil, false, false, limit)
+	if result["ok"] == false {
+		return result
+	}
 	return map[string]any{"ok": result["ok"], "query": query, "symbols": result["matches"], "engine": result["engine"]}
 }
 
@@ -939,6 +1117,9 @@ func runProcessInput(parent context.Context, directory string, timeout time.Dura
 	command.Stdout = stdout
 	command.Stderr = stderr
 	configureProcessGroup(command)
+	if ctx.Err() != nil {
+		return processResult{ExitCode: -1, Stderr: ctx.Err().Error()}
+	}
 	err := command.Start()
 	if err == nil {
 		done := make(chan error, 1)
@@ -963,8 +1144,11 @@ func runProcessInput(parent context.Context, directory string, timeout time.Dura
 }
 
 func (e *Engine) runArtifactProcess(parent context.Context, tool, directory string, timeout time.Duration, env []string, limit int, binary string, arguments ...string) (processResult, string, int64, int64, error) {
+	if err := e.operationCheckpoint(parent, "subprocess", 0, 0); err != nil {
+		return processResult{}, "", 0, 0, err
+	}
 	id := randomID()
-	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: tool, CWD: directory, RequestID: id})
+	heavyLease, acquired := e.acquireHeavyOperation(heavyOperationSpec{Tool: tool, CWD: directory, RequestID: id, Context: parent})
 	if !acquired {
 		return processResult{}, "", 0, 0, e.heavyBusyError()
 	}
@@ -982,7 +1166,7 @@ func (e *Engine) runArtifactProcess(parent context.Context, tool, directory stri
 	}
 	started := time.Now()
 	safeCommand := binary + " " + strings.Join(arguments, " ")
-	e.writeCommandAudit("start", id, tool, safeCommand, directory, 0, 0, 0, "running")
+	e.writeCommandAuditContext(parent, "start", id, tool, safeCommand, directory, 0, 0, 0, "running")
 	ctx, cancel := context.WithTimeout(operationContext, timeout)
 	defer cancel()
 	command := exec.Command(binary, arguments...)
@@ -993,15 +1177,31 @@ func (e *Engine) runArtifactProcess(parent context.Context, tool, directory stri
 	command.Stdout = capture.stdout
 	command.Stderr = capture.stderr
 	configureProcessGroup(command)
+	if ctx.Err() != nil {
+		_ = capture.Close()
+		return processResult{}, id, 0, 0, ctx.Err()
+	}
 	runErr := command.Start()
 	if runErr == nil {
+		e.operationProcess(parent, command.Process.Pid)
+		defer e.operationProcess(parent, 0)
 		done := make(chan error, 1)
 		go func() { done <- command.Wait() }()
 		select {
 		case runErr = <-done:
 		case <-ctx.Done():
-			_, _ = terminateProcessGroup(command.Process.Pid, 0)
-			runErr = <-done
+			select {
+			case runErr = <-done:
+			default:
+				if ctx.Err() == context.Canceled {
+					e.acknowledgeCancellation(parent)
+				}
+				_, stopErr := terminateProcessGroup(command.Process.Pid, e.settings.KillGrace)
+				if stopErr != nil {
+					e.operationCancelError(currentOperation(parent), failure("process_stop_failed", stopErr.Error()))
+				}
+				runErr = <-done
+			}
 		}
 	}
 	closeErr := capture.Close()
@@ -1010,7 +1210,7 @@ func (e *Engine) runArtifactProcess(parent context.Context, tool, directory stri
 	if runErr != nil || closeErr != nil {
 		status = "failed"
 	}
-	e.writeCommandAudit("finish", id, tool, safeCommand, directory, time.Since(started), stdoutBytes, stderrBytes, status)
+	e.writeCommandAuditContext(parent, "finish", id, tool, safeCommand, directory, time.Since(started), stdoutBytes, stderrBytes, status)
 	if closeErr != nil {
 		return processResult{}, id, stdoutBytes, stderrBytes, closeErr
 	}
@@ -1043,4 +1243,31 @@ func combinedStreamPreviewLimits(limit int, stdoutBytes, stderrBytes int64) (int
 		stdoutLimit, stderrLimit = 1, available-1
 	}
 	return stdoutLimit, stderrLimit
+}
+
+func (e *Engine) readBytesContext(ctx context.Context, path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data := []byte{}
+	buffer := make([]byte, 65536)
+	for {
+		if err := e.operationCheckpoint(ctx, "reading", 0, 0); err != nil {
+			return nil, err
+		}
+		n, readErr := file.Read(buffer)
+		data = append(data, buffer[:n]...)
+		if int64(len(data)) > e.settings.MaxFileBytes {
+			return nil, fmt.Errorf("file exceeds MAX_FILE_BYTES")
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	return data, ctx.Err()
 }

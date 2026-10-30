@@ -17,6 +17,7 @@ from typing import Any
 
 from . import profile as _profile_module
 from .bounded_subprocess import run_bounded
+from .operations import CURRENT, OperationCancelled, cancellation_acknowledged, checkpoint, process_started, process_stopped
 from .config import Settings
 from .git_tools import _repo_rel, _resolve_repo_toplevel
 from .output_store import (
@@ -112,6 +113,7 @@ JOB_PROCS: dict[str, subprocess.Popen[bytes]] = {}
 JOB_DRAIN_THREADS: dict[str, tuple[threading.Thread, threading.Thread]] = {}
 JOB_CAPTURE_ERRORS: dict[str, list[str]] = {}
 JOB_LOCK = threading.RLock()
+JOB_TIMEOUT_EVENTS: dict[str, threading.Event] = {}
 AUDIT_LOCK = threading.RLock()
 
 _UNRESTRICTED_MODES = {"unrestricted", "full_repo"}
@@ -443,6 +445,12 @@ def _command_env(extra_env: dict[str, str] | None = None, settings: Settings | N
 
 
 def _audit(settings: Settings, payload: dict[str, Any]) -> None:
+    operation = CURRENT.get()
+    if operation is not None and "operation_id" not in payload:
+        payload = {**payload, "operation_id": operation.id,
+                   "server_instance_id": operation.registry.instance_id,
+                   "parent_operation_id": operation.parent.id if operation.parent else None,
+                   "session_id": operation.identity.get("session_id")}
     path = settings.command_audit_log_path
     try:
         with AUDIT_LOCK:
@@ -539,6 +547,7 @@ def run_command(
     try:
         stdout_artifact = store.open(log_id, "stdout", out_path, output_limit)
         stderr_artifact = store.open(log_id, "stderr", err_path, output_limit)
+        checkpoint(phase="starting_process")
         proc = subprocess.Popen(
             ["/bin/bash", "-lc", _bash_command(normalized, settings)],
             cwd=str(run_cwd),
@@ -547,9 +556,14 @@ def run_command(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        owner = CURRENT.get()
         def cancel_process() -> None:
+            if proc.poll() is not None:
+                return
+            cancellation_acknowledged(owner)
             _terminate_process_group(proc.pid, grace_seconds=settings.kill_grace_ms / 1000)
 
+        process_started(proc.pid)
         heavy_lease.set_cancel(cancel_process)
         drain_errors: list[BaseException] = []
 
@@ -662,6 +676,14 @@ def run_command(
             "stdout_bytes": stdout_artifact.bytes_written,
             "stderr_bytes": stderr_artifact.bytes_written,
         }
+    except OperationCancelled:
+        for artifact in (stdout_artifact, stderr_artifact):
+            if artifact is not None:
+                artifact.abort()
+        store.abort_artifact(log_id)
+        process_stopped()
+        heavy_lease.release()
+        raise
     except (OSError, ArtifactQuotaError) as exc:
         for artifact in (stdout_artifact, stderr_artifact):
             if artifact is not None:
@@ -702,6 +724,7 @@ def run_command(
             "policy_source": "preset" if policy_exempt else "direct",
         },
     )
+    process_stopped()
     heavy_lease.release()
     result["policy_source"] = "preset" if policy_exempt else "direct"
     return result
@@ -883,6 +906,7 @@ def start_command_job(
             if on_conflict == "wait":
                 deadline = time.time() + min(effective_timeout_ms / 1000, 30)
                 while time.time() < deadline:
+                    checkpoint(phase="waiting_job")
                     time.sleep(0.2)
                     existing = _active_lock_job(settings, concurrency_key)
                     if not existing:
@@ -926,7 +950,7 @@ def start_command_job(
     err_artifact: OutputArtifact | None = None
     proc: subprocess.Popen[bytes] | None = None
 
-    def fail_start(exc: OSError | ValueError, error_kind: str) -> None:
+    def fail_start(exc: OSError | ValueError | OperationCancelled, error_kind: str) -> None:
         if proc is not None:
             _terminate_process_group(proc.pid, grace_seconds=0)
             try:
@@ -941,6 +965,8 @@ def start_command_job(
                 output_artifact.abort()
         store.abort_artifact(job_id)
         store.release_lifecycle(job_id)
+        if heavy_lease.tracked is not None:
+            heavy_lease.tracked.finish("cancelled" if isinstance(exc, OperationCancelled) else "failed")
         heavy_lease.release()
         _audit(settings, {
             "timestamp": int(time.time()), "event": "heavy_finished", "request_id": job_id,
@@ -953,6 +979,8 @@ def start_command_job(
     try:
         out_artifact = store.open(job_id, "stdout", out_path, settings.max_command_output_chars)
         err_artifact = store.open(job_id, "stderr", err_path, settings.max_command_output_chars)
+        if heavy_lease.tracked is not None:
+            heavy_lease.tracked.checkpoint(phase="starting_process")
         proc = subprocess.Popen(
             ["/bin/bash", "-lc", _bash_command(normalized, settings)],
             cwd=str(run_cwd),
@@ -961,7 +989,7 @@ def start_command_job(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, OperationCancelled) as exc:
         fail_start(exc, "artifact_capture_failed" if out_artifact is not None else "command_spawn_error")
         raise
 
@@ -980,6 +1008,8 @@ def start_command_job(
     out_thread = threading.Thread(target=drain, args=(proc.stdout, out_artifact), daemon=True, name=f"chatrepo-job-out-{job_id[:8]}")
     err_thread = threading.Thread(target=drain, args=(proc.stderr, err_artifact), daemon=True, name=f"chatrepo-job-err-{job_id[:8]}")
     def finish_heavy_audit() -> None:
+        token = CURRENT.set(heavy_lease.tracked)
+        final_status = "failed"
         try:
             proc.wait()
             try:
@@ -991,56 +1021,61 @@ def start_command_job(
                 with JOB_LOCK:
                     JOB_CAPTURE_ERRORS.setdefault(job_id, []).append(str(exc))
                 drain_cleanup, process_group_cleaned, forced_pipe_close = "failed", False, True
-            with JOB_LOCK:
-                terminal = {"completed", "failed", "cancelled", "timed_out"}
-                finished_meta = _read_job_meta(settings, job_id)
-                capture_errors = JOB_CAPTURE_ERRORS.pop(job_id, [])
-                status = str(finished_meta.get("status", "running"))
-                if status not in terminal:
-                    if finished_meta.get("cancel_requested"):
-                        status = "cancelled"
-                        finished_meta["termination_reason"] = "user_cancel"
-                    elif finished_meta.get("timed_out") or finished_meta.get("termination_reason") == "timeout":
-                        status = "timed_out"
-                        finished_meta["termination_reason"] = "timeout"
-                    elif capture_errors or proc.returncode not in {0, None}:
-                        status = "failed"
-                        finished_meta["termination_reason"] = (
-                            "artifact_capture_failed" if capture_errors else "nonzero_exit"
-                        )
-                    else:
-                        status = "completed"
-                        finished_meta["termination_reason"] = "completed"
-                if capture_errors:
-                    status = "failed"
-                    finished_meta["error_kind"] = "artifact_capture_failed"
-                    finished_meta["capture_error"] = capture_errors[0]
-                    out_artifact.abort()
-                    err_artifact.abort()
-                    store.abort_artifact(job_id, preserve_manifest=True)
-                    finished_meta.pop("stdout_sha256", None)
-                    finished_meta.pop("stderr_sha256", None)
-                finished_meta.update({
-                    "status": status,
-                    "complete": not capture_errors,
-                    "exit_code": proc.returncode,
-                    "finished_at": finished_meta.get("finished_at") or _utc_now(),
-                    "stdout_bytes": 0 if capture_errors else out_artifact.bytes_written,
-                    "stderr_bytes": 0 if capture_errors else err_artifact.bytes_written,
-                    "output_truncated": (
-                        out_artifact.bytes_written > len(out_artifact.head.encode("utf-8"))
-                        or err_artifact.bytes_written > len(err_artifact.head.encode("utf-8"))
-                    ),
-                    "drain_cleanup": drain_cleanup,
-                    "forced_pipe_close": forced_pipe_close,
-                    "process_group_cleaned": process_group_cleaned,
-                })
-                if not capture_errors:
-                    finished_meta["stdout_sha256"] = out_artifact.sha256
-                    finished_meta["stderr_sha256"] = err_artifact.sha256
-                _write_job_meta(settings, job_id, finished_meta)
-                JOB_PROCS.pop(job_id, None)
-                JOB_DRAIN_THREADS.pop(job_id, None)
+            while True:
+                with JOB_LOCK:
+                    timeout_event = JOB_TIMEOUT_EVENTS.get(job_id)
+                    if timeout_event is None or timeout_event.is_set():
+                        terminal = {"completed", "failed", "cancelled", "timed_out"}
+                        finished_meta = _read_job_meta(settings, job_id)
+                        capture_errors = JOB_CAPTURE_ERRORS.pop(job_id, [])
+                        status = str(finished_meta.get("status", "running"))
+                        if status not in terminal:
+                            if finished_meta.get("cancel_requested"):
+                                status = "cancelled"
+                                finished_meta["termination_reason"] = "user_cancel"
+                            elif finished_meta.get("timed_out") or finished_meta.get("termination_reason") == "timeout":
+                                status = "timed_out"
+                                finished_meta["termination_reason"] = "timeout"
+                            elif capture_errors or proc.returncode not in {0, None}:
+                                status = "failed"
+                                finished_meta["termination_reason"] = (
+                                    "artifact_capture_failed" if capture_errors else "nonzero_exit"
+                                )
+                            else:
+                                status = "completed"
+                                finished_meta["termination_reason"] = "completed"
+                        if capture_errors:
+                            status = "failed"
+                            finished_meta["error_kind"] = "artifact_capture_failed"
+                            finished_meta["capture_error"] = capture_errors[0]
+                            out_artifact.abort()
+                            err_artifact.abort()
+                            store.abort_artifact(job_id, preserve_manifest=True)
+                            finished_meta.pop("stdout_sha256", None)
+                            finished_meta.pop("stderr_sha256", None)
+                        finished_meta.update({
+                            "status": status,
+                            "complete": not capture_errors,
+                            "exit_code": proc.returncode,
+                            "finished_at": finished_meta.get("finished_at") or _utc_now(),
+                            "stdout_bytes": 0 if capture_errors else out_artifact.bytes_written,
+                            "stderr_bytes": 0 if capture_errors else err_artifact.bytes_written,
+                            "output_truncated": (
+                                out_artifact.bytes_written > len(out_artifact.head.encode("utf-8"))
+                                or err_artifact.bytes_written > len(err_artifact.head.encode("utf-8"))
+                            ),
+                            "drain_cleanup": drain_cleanup,
+                            "forced_pipe_close": forced_pipe_close,
+                            "process_group_cleaned": process_group_cleaned,
+                        })
+                        if not capture_errors:
+                            finished_meta["stdout_sha256"] = out_artifact.sha256
+                            finished_meta["stderr_sha256"] = err_artifact.sha256
+                        _write_job_meta(settings, job_id, finished_meta)
+                        JOB_PROCS.pop(job_id, None)
+                        JOB_DRAIN_THREADS.pop(job_id, None)
+                        break
+                timeout_event.wait()
             _clear_lock(settings, finished_meta.get("concurrency_key"), job_id)
             _audit(settings, {
                 "timestamp": int(time.time()), "event": "heavy_finished", "request_id": job_id,
@@ -1049,9 +1084,14 @@ def start_command_job(
                 "bytes": out_artifact.bytes_written + err_artifact.bytes_written,
                 "status": str(finished_meta["status"]),
             })
+            final_status = str(finished_meta["status"])
         finally:
+            process_stopped(heavy_lease.tracked)
+            if heavy_lease.tracked is not None:
+                heavy_lease.tracked.finish(final_status)
             heavy_lease.release()
             store.release_lifecycle(job_id)
+            CURRENT.reset(token)
 
     now = _utc_now()
     meta = {
@@ -1081,10 +1121,11 @@ def start_command_job(
         "output_truncated": False,
         "concurrency_key": concurrency_key,
         "policy_source": "preset" if policy_exempt else "direct",
+        "background_operation_id": heavy_lease.tracked.id if heavy_lease.tracked else None,
     }
     try:
         _write_job_meta(settings, job_id, meta)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, OperationCancelled) as exc:
         fail_start(exc, "artifact_metadata_failed")
         raise
     out_thread.start()
@@ -1092,6 +1133,13 @@ def start_command_job(
     with JOB_LOCK:
         JOB_PROCS[job_id] = proc
         JOB_DRAIN_THREADS[job_id] = (out_thread, err_thread)
+    process_started(proc.pid, heavy_lease.tracked)
+    def cancel_owned_job() -> None:
+        result = cancel_command_job(job_id, settings)
+        if result.get("ok") is False:
+            raise OSError(str(result.get("error", "Job cancellation failed")))
+
+    heavy_lease.set_cancel(cancel_owned_job)
     threading.Thread(
         target=finish_heavy_audit, daemon=True, name=f"chatrepo-heavy-{job_id[:8]}",
     ).start()
@@ -1108,6 +1156,7 @@ def start_command_job(
     return {
         "ok": True,
         "job_id": job_id,
+        "background_operation_id": heavy_lease.tracked.id if heavy_lease.tracked else None,
         "status": "running",
         "lock_status": "acquired" if concurrency_key else "none",
         "pid": proc.pid,
@@ -1226,35 +1275,46 @@ def _close_pipe_transport(pipe: Any) -> None:
 
 
 def _watch_job_timeout(job_id: str, settings: Settings, timeout_ms: int) -> None:
-    """Enforce a background-job timeout even if no client polls the job."""
+    """Terminate independently, then let the capture finisher publish the outcome."""
     time.sleep(max(timeout_ms, 1) / 1000)
-    try:
-        meta = _read_job_meta(settings, job_id)
-        pid = int(meta["pid"])
-    except (OSError, KeyError, ValueError, json.JSONDecodeError):
-        return
-    if not _is_process_group_running(pid):
-        return
-    meta["status"] = "terminating"
-    meta["timed_out"] = True
-    meta["termination_reason"] = "timeout"
-    _write_job_meta(settings, job_id, meta)
-    kill_status = _terminate_process_group(pid, grace_seconds=settings.kill_grace_ms / 1000)
     with JOB_LOCK:
-        proc = JOB_PROCS.pop(job_id, None)
-    if proc is not None:
         try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
-    meta["status"] = "timed_out"
-    meta["kill_status"] = kill_status
-    meta["timed_out"] = True
-    meta["termination_reason"] = "timeout"
-    meta["finished_at"] = _utc_now()
-    meta["process_group_cleaned"] = _wait_process_group_cleaned(pid)
-    _write_job_meta(settings, job_id, meta)
-    _clear_lock(settings, meta.get("concurrency_key"), job_id)
+            meta = _read_job_meta(settings, job_id)
+            pid = int(meta["pid"])
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            return
+        if not _is_process_group_running(pid):
+            return
+        done = threading.Event()
+        JOB_TIMEOUT_EVENTS[job_id] = done
+        meta.update(status="terminating", timed_out=True, termination_reason="timeout")
+        try:
+            _write_job_meta(settings, job_id, meta)
+        except BaseException:
+            JOB_TIMEOUT_EVENTS.pop(job_id, None)
+            done.set()
+            raise
+    try:
+        # Do not serialize TERM/KILL grace periods for unrelated jobs.
+        kill_status = _terminate_process_group(pid, grace_seconds=settings.kill_grace_ms / 1000)
+        with JOB_LOCK:
+            proc = JOB_PROCS.pop(job_id, None)
+        if proc is not None:
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        cleaned = _wait_process_group_cleaned(pid)
+        with JOB_LOCK:
+            latest = _read_job_meta(settings, job_id)
+            latest.update(status="timed_out", kill_status=kill_status, timed_out=True,
+                          termination_reason="timeout", finished_at=_utc_now(), process_group_cleaned=cleaned)
+            _write_job_meta(settings, job_id, latest)
+            _clear_lock(settings, latest.get("concurrency_key"), job_id)
+    finally:
+        done.set()
+        with JOB_LOCK:
+            JOB_TIMEOUT_EVENTS.pop(job_id, None)
 
 
 def _write_lock(settings: Settings, concurrency_key: str, job_id: str) -> None:
@@ -1271,7 +1331,7 @@ def _clear_lock(settings: Settings, concurrency_key: str | None, job_id: str) ->
         return
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (FileNotFoundError, json.JSONDecodeError):
         path.unlink(missing_ok=True)
         return
     if data.get("job_id") == job_id:
@@ -1294,6 +1354,8 @@ def _active_lock_job(settings: Settings, concurrency_key: str) -> dict[str, Any]
         return {
             "job_id": job_id,
             "attached_to_job_id": job_id,
+            "log_id": str(meta.get("log_id", job_id)),
+            "background_operation_id": meta.get("background_operation_id"),
             "pid": pid,
             "concurrency_key": concurrency_key,
             "timeout_ms": int(meta.get("timeout_ms", settings.command_job_timeout_ms)),
@@ -1375,6 +1437,7 @@ def get_command_job(job_id: str, settings: Settings, *, tail_lines: int | None =
     return {
         "ok": meta["status"] in {"running", "completed"},
         "job_id": job_id,
+        "background_operation_id": meta.get("background_operation_id"),
         "status": meta["status"],
         "running": running,
         "exit_code": meta.get("exit_code", return_code),
@@ -1570,6 +1633,8 @@ def cancel_command_job(job_id: str, settings: Settings) -> dict[str, Any]:
     pid = int(meta["pid"])
     if meta.get("status") in {"completed", "failed", "cancelled", "timed_out"}:
         return {"ok": True, "job_id": job_id, "status": meta["status"], "cancelled": False}
+    from .operations import note_resource_cancel
+    note_resource_cancel(settings, job_id)
     meta["cancel_requested"] = True
     meta["status"] = "terminating"
     _write_job_meta(settings, job_id, meta)
